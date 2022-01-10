@@ -10,9 +10,13 @@ from torch import autograd
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 from tqdm import tqdm
 
+import src.multiclass_weights_optimize as weighting
 from src.actor import Actor
 from src.constants import CUDA, EVAL_BATCH_SIZE, ADAPT_STEPS, ADAPT_BATCH_SIZE, TASK_NAME, SEED, NUM_ITERATIONS, \
-    META_BATCH_SIZE, MAX_KL, LS_MAX_STEPS, LOGS_FOLDER, LOGS_ITERATION, LS_LR_ALPHA, META_LR
+    META_BATCH_SIZE, MAX_KL, LS_MAX_STEPS, LOGS_FOLDER, LOGS_ITERATION, LS_LR_ALPHA, META_LR, SPSA_ALPHA_STRATEGY, \
+    SPSA_ALPHA, SPSA_ALPHA_EXP_GAMMA, SPSA_ALPHA_STEP_STEP_EVERY, SPSA_ALPHA_STEP_MULTIPLIER, SPSA_BETA_STRATEGY, \
+    SPSA_BETA, SPSA_BETA_EXP_GAMMA, SPSA_BETA_STEP_STEP_EVERY, SPSA_BETA_STEP_MULTIPLIER, TASK_WEIGHTING, \
+    NORMALIZE_SPSA_WEIGHTS_AFTER, PRETRAIN_NUM_ITERATIONS
 from src.critic import Critic
 from src.maml import fast_adapt, maml_loss
 from src.runner import Runner
@@ -83,15 +87,35 @@ def main():
     torch.cuda.manual_seed(SEED)
     device = torch.device("cuda" if CUDA else "cpu")
 
+    alpha = weighting.get_param_strategy(SPSA_ALPHA_STRATEGY,
+                                         SPSA_ALPHA,
+                                         SPSA_ALPHA_EXP_GAMMA,
+                                         SPSA_ALPHA_STEP_STEP_EVERY,
+                                         SPSA_ALPHA_STEP_MULTIPLIER)
+    beta = weighting.get_param_strategy(SPSA_BETA_STRATEGY,
+                                        SPSA_BETA,
+                                        SPSA_BETA_EXP_GAMMA,
+                                        SPSA_BETA_STEP_STEP_EVERY,
+                                        SPSA_BETA_STEP_MULTIPLIER)
+
+    if TASK_WEIGHTING == 'none':
+        task_weighting = weighting.TaskWeightingNone(device)
+    elif TASK_WEIGHTING == 'spsa-delta':
+        task_weighting = weighting.SpsaWeighting(META_BATCH_SIZE, alpha, beta, device)
+    else:
+        raise ValueError(f'Unknown weighting value: {TASK_WEIGHTING}')
+
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.shape[0]
 
     # learner, critic = load_models("best_eval_reward_learner.pkl", "best_eval_reward_critic.pkl")
     learner = Actor(state_size, action_size, device=device).to(device)
     critic = Critic(state_size, device=device)
+    weight_normalizer = weighting.WeightNormalizer(normalize_after=NORMALIZE_SPSA_WEIGHTS_AFTER)
 
     train_reward, train_success = [], []
     eval_reward, eval_success = [], []
+    train_losses, train_kl, train_grad = [], [], []
     best_train_reward, best_train_success = 0, 0
     best_eval_reward, best_eval_success = 0, 0
 
@@ -159,10 +183,15 @@ def main():
         # Outer Loop / TRPO
         # Estimate policy gradient g_k
         # theta_old, D_KL old
-        old_loss, old_kl = maml_loss(iteration_replays, iteration_policies, learner, critic)
+        # task_weighting.before_gradient_step(iteration, batch)
+        old_loss, old_kl, old_outer_losses = maml_loss(iteration_replays, iteration_policies, learner, critic,
+                                                       task_weighting, iteration)
+        train_kl.append(old_kl.item())
+        train_losses.append(old_loss.item())
+        # old_outer_losses.detach_()
         grad = autograd.grad(old_loss, learner.parameters(), retain_graph=True)
         grad = parameters_to_vector([g.detach() for g in grad])
-
+        train_grad.append(grad.detach().mean().item())
         # Use CG to obtain x_k
         step = conjugate_gradient(old_kl, learner, grad)
 
@@ -176,7 +205,7 @@ def main():
 
         # Compute proposed policy step delta_k
         step = step_
-        del old_kl, grad
+        del old_kl, grad, old_outer_losses
         old_loss.detach_()
 
         # Perform backtracking Line Search for TRPO to obtain final update
@@ -192,16 +221,25 @@ def main():
                 param.data.add_(other=delta.data, alpha=-META_LR * LS_LR_ALPHA ** ls_step)
 
             # Compute proposed update theta, new_loss
-            new_loss, kl = maml_loss(iteration_replays, iteration_policies, adapter, critic)
+            new_loss, kl, new_outer_losses = maml_loss(iteration_replays, iteration_policies, adapter, critic,
+                                                       task_weighting, iteration)
             del adapter
 
             # Verification
             if new_loss < old_loss and kl < MAX_KL:
+
                 for param, delta in zip(learner.parameters(), step):
                     param.data.add_(other=delta.data, alpha=-META_LR * LS_LR_ALPHA ** ls_step)
+
+                if iteration >= PRETRAIN_NUM_ITERATIONS:
+                    task_weighting.update_inner_weights(iteration, new_outer_losses)
+
+                    if hasattr(task_weighting, 'weights'):
+                        task_weighting.weights = weight_normalizer.normalize(iteration, task_weighting.weights)
+
                 break
 
-            del new_loss, kl
+            del new_loss, kl, new_outer_losses
 
         del old_loss
         del iteration_replays, iteration_policies
@@ -225,6 +263,24 @@ def main():
                 'success': eval_success
             })
             eval_df.to_csv(f"{LOGS_FOLDER}eval_log.csv", index=False)
+
+            loss_df = pd.DataFrame({
+                'iteration': iteration,
+                'loss': train_losses
+            })
+            loss_df.to_csv(f"{LOGS_FOLDER}train_loss.csv", index=False)
+
+            kl_df = pd.DataFrame({
+                'iteration': iteration,
+                'kl': train_kl
+            })
+            kl_df.to_csv(f"{LOGS_FOLDER}train_kl.csv", index=False)
+
+            grad_df = pd.DataFrame({
+                'iteration': iteration,
+                'grad': train_grad
+            })
+            grad_df.to_csv(f"{LOGS_FOLDER}train_grad.csv", index=False)
 
             if s > best_eval_success:
                 print("Saving best eval success")

@@ -2,7 +2,7 @@ from torch import autograd
 from torch.distributions.kl import kl_divergence
 from tqdm import tqdm
 
-from src.constants import ADAPT_LR
+from src.constants import ADAPT_LR, PRETRAIN_NUM_ITERATIONS
 from src.utils import compute_advantages, normalize, update_module, clone_module
 
 
@@ -37,9 +37,9 @@ def fast_adapt(actor, train_episodes, critic):
     return updated_actor
 
 
-def maml_loss(iteration_replays, iteration_policies, actor, critic):
-    mean_loss = 0.0
+def maml_loss(iteration_replays, iteration_policies, actor, critic, task_weighting, iteration):
     mean_kl = 0.0
+    outer_losses = []
     for task_replays, old_policy in tqdm(zip(iteration_replays, iteration_policies),
                                          total=len(iteration_replays),
                                          desc='MAML Loss',
@@ -68,9 +68,13 @@ def maml_loss(iteration_replays, iteration_policies, actor, critic):
         old_log_probs = old_densities.log_prob(actions).mean(dim=1, keepdim=True).detach()
         new_log_probs = new_densities.log_prob(actions).mean(dim=1, keepdim=True)
         del old_densities, new_densities
-        mean_loss += actor.loss(old_log_probs, advantages, new_log_probs)
+        outer_losses.append(actor.loss(old_log_probs, advantages, new_log_probs))
         del old_log_probs, new_log_probs, advantages
 
     mean_kl /= len(iteration_replays)
-    mean_loss /= len(iteration_replays)
-    return mean_loss, mean_kl
+
+    if iteration >= PRETRAIN_NUM_ITERATIONS:
+        mean_loss_2 = task_weighting.compute_weighted_loss(0, outer_losses)
+    else:
+        mean_loss_2 = sum(outer_losses) / len(outer_losses)
+    return mean_loss_2, mean_kl, outer_losses
